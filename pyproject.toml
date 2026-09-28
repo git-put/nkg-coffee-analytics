@@ -1,0 +1,23 @@
+[project]
+name = "nkg-coffee-analytics"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Senthil Kumar Govindarajan", email = "govindarajan.senthilkumar.id@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "dbt-duckdb>=1.11.0",
+    "duckdb>=1.5.5",
+    "numpy>=2.5.3",
+    "pandas>=3.0.6",
+    "requests>=2.34.2",
+]
+
+[project.scripts]
+nkg-coffee-analytics = "nkg_coffee_analytics:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
