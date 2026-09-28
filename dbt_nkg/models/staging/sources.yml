@@ -5,3 +5,5 @@ sources:
     schema: main
     tables:
       - name: raw_coffee_trades
+      - name: raw_futures_prices
+      - name: raw_shipments

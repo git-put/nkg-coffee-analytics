@@ -8,10 +8,9 @@ select
     warehouse_location,
     trade_type,
     quantity_bags,
-    purchase_price_usd,
-    live_market_price_usd,
-    fx_usd_eur,
-    fx_usd_brl,
+    cast(trade_price_usd as double) as trade_price_usd,
+    cast(fx_usd_eur as double) as fx_usd_eur,
+    cast(fx_usd_brl as double) as fx_usd_brl,
     fx_source,
     eudr_status,
     ingested_at

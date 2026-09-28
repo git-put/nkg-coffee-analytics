@@ -33,3 +33,5 @@ models:
   dbt_nkg:
     staging:
       +materialized: view
+    marts:
+      +materialized: table
