@@ -10,3 +10,7 @@ wheels/
 .venv
 *.duckdb
 .env
+dbt_nkg/target/
+dbt_nkg/logs/
+logs/
+.user.yml

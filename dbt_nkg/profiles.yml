@@ -1,0 +1,7 @@
+dbt_nkg:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('NKG_DB_PATH', '../nkg_trading.duckdb') }}"
+      threads: 1
