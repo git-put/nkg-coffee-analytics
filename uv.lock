@@ -645,22 +645,26 @@ name = "nkg-coffee-analytics"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "altair" },
     { name = "dbt-duckdb" },
     { name = "duckdb" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "requests" },
     { name = "streamlit" },
+    { name = "tzdata" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "altair", specifier = ">=6.3.0" },
     { name = "dbt-duckdb", specifier = ">=1.11.0" },
     { name = "duckdb", specifier = ">=1.5.5" },
     { name = "numpy", specifier = ">=2.5.3" },
     { name = "pandas", specifier = ">=3.0.6" },
     { name = "requests", specifier = ">=2.34.2" },
     { name = "streamlit", specifier = ">=1.64.0" },
+    { name = "tzdata", specifier = ">=2026.4" },
 ]
 
 [[package]]
