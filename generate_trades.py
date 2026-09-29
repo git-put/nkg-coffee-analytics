@@ -6,12 +6,18 @@ This is the file you run:   python generate_trades.py
 
 What it does, in plain English:
   SECTION 1 - Gets USD->EUR / USD->BRL rates (live, or clearly labelled fallback).
-  SECTION 2 - Simulates today's ICE-style futures price (a random walk, labelled 'simulated').
-  SECTION 3 - Generates 50 synthetic coffee trades priced around that futures price, plus the
-              shipping containers that carry the physical purchases to port hubs.
-  SECTION 4 - Checks all the generated data for problems BEFORE it touches the database.
-  SECTION 5 - Writes three tables to DuckDB in ONE transaction (all rows land, or none do):
+  SECTION 2 - On the FIRST run of each Berlin calendar day only: seeds a plausible
+              random-walk price history from 08:00 to now, so the price chart never
+              opens as a single flat point (see generate_futures_prices.py).
+  SECTION 3 - Simulates today's live ICE-style futures price tick (labelled 'simulated').
+  SECTION 4 - Generates a small batch of synthetic coffee trades priced around that
+              futures price, plus the shipping containers that carry the physical
+              purchases to port hubs.
+  SECTION 5 - Checks all the generated data for problems BEFORE it touches the database.
+  SECTION 6 - Writes three tables to DuckDB in ONE transaction (all rows land, or none do):
                 raw_futures_prices, raw_coffee_trades, raw_shipments
+  SECTION 7 - Prunes rows from BEFORE today (Berlin calendar day) out of every raw table,
+              so the database resets itself each morning instead of growing forever.
 
 Every step prints what it is doing, so you can read the output like a story.
 [OK] = step passed, [WARN] = something odd but handled, [FAIL] = step broke.
@@ -22,6 +28,7 @@ import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import duckdb
 import numpy as np
@@ -30,7 +37,7 @@ import pandas as pd
 from generate_exchange_rates import fail, fetch_live_fx_rates, info, ok, section, warn
 from generate_futures_prices import TABLE_COLUMNS as FUTURES_COLUMNS
 from generate_futures_prices import TABLE_NAME as FUTURES_TABLE
-from generate_futures_prices import simulate_futures_price
+from generate_futures_prices import backfill_todays_price_history, simulate_futures_price
 
 # ----------------------------------------------------------------------------
 # CONFIGURATION (everything you might want to change lives here)
@@ -38,9 +45,19 @@ from generate_futures_prices import simulate_futures_price
 # Override with an environment variable if you want the DB somewhere else.
 DB_PATH = Path(os.environ.get("NKG_DB_PATH", "nkg_trading.duckdb")).resolve()
 
-N_TRADES = 50
+N_TRADES = int(os.environ.get("NKG_TRADE_COUNT", "50"))  # override for a lighter, faster loop cadence
 RANDOM_SEED = None  # set to an int (e.g. 42) for reproducible fake data
 PRICE_SPREAD_USD = 15  # trade prices are set within +/- this many USD of the futures price
+
+# Pruning: this project is meant to run only during a German working day (see
+# refresh_loop.py) and be stopped overnight, so "keep everything from today"
+# is simpler and safer than a row-count cutoff - a row-count budget has to be
+# recalculated by hand every time the loop's cadence changes (it already bit
+# us once: at 1 run/minute, "keep the last 240 runs" only covers 4 hours,
+# which would have quietly deleted the morning's backfilled price history by
+# early afternoon). "Today, Berlin calendar day" needs no tuning and can
+# never lose data still relevant to today's chart.
+BUSINESS_TZ = ZoneInfo("Europe/Berlin")
 
 ORIGINS = ["Brazil (Santos)", "Colombia (Excelso)", "Vietnam (Robusta)", "Ethiopia (Yirgacheffe)"]
 WAREHOUSES = ["NKG Kala Hamburg", "Antwerp Port Hub", "Santos Warehouse", "Bremen Logistics Center"]
@@ -118,7 +135,7 @@ class SchemaMismatchError(Exception):
 # SECTION 3 - GENERATE TRADES AND SHIPMENTS
 # ----------------------------------------------------------------------------
 def generate_raw_coffee_trades(fx, futures_price, rng, run_id, run_ts):
-    section("SECTION 3 - Generating synthetic trades and shipments")
+    section("SECTION 4 - Generating synthetic trades and shipments")
     info(
         f"Trade prices are set within +/- {PRICE_SPREAD_USD} USD of the simulated futures price "
         f"({futures_price} USD per bag)"
@@ -336,7 +353,7 @@ def count_rows(con, table):
 
 def write_to_duckdb(batches):
     """batches: list of (table_name, columns_dict, dataframe). Written in ONE transaction."""
-    section("SECTION 5 - Writing to DuckDB")
+    section("SECTION 6 - Writing to DuckDB")
     info(f"Database file: {DB_PATH}")
 
     con = None
@@ -386,6 +403,69 @@ def write_to_duckdb(batches):
             info("Database connection closed")
 
 
+def berlin_midnight_utc(now_utc):
+    """
+    Midnight at the start of 'now's Berlin calendar date, expressed as a naive
+    UTC timestamp (matching how every timestamp in this project is stored).
+    Used only for pruning - "delete anything from before today" - which is a
+    different boundary from workday_start_utc's 08:00 (used for backfill).
+    """
+    now_utc_aware = now_utc if now_utc.tzinfo is not None else now_utc.replace(tzinfo=timezone.utc)
+    now_berlin = now_utc_aware.astimezone(BUSINESS_TZ)
+    midnight_berlin = now_berlin.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight_berlin.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def prune_old_runs(now_utc):
+    """
+    Keeps the database bounded without ever needing to be re-tuned when the
+    loop's cadence changes: deletes any row timestamped before the start of
+    today (Berlin calendar day) from every raw table. Since this project is
+    only meant to run during a working day and be stopped overnight, "keep
+    today, drop everything older" naturally resets the database each morning
+    at whatever size a working day's worth of data comes to - it also means
+    this morning's backfilled price history is never at risk of being pruned
+    away later the same afternoon, which a fixed row-count budget could do.
+
+    This is its own short connection, separate from the write transaction in
+    write_to_duckdb, so a pruning problem can never undo data that was
+    already safely written.
+    """
+    section("SECTION 7 - Pruning rows from before today (Berlin calendar day)")
+    cutoff = berlin_midnight_utc(now_utc)
+    info(f"Keeping rows from {cutoff} UTC (today, Europe/Berlin) onward; anything older is removed")
+
+    con = None
+    try:
+        con = duckdb.connect(str(DB_PATH))
+        # Futures prices are keyed by price_timestamp; trades and shipments
+        # both carry ingested_at, which is when this project actually wrote
+        # them (simpler and always present, unlike trade_timestamp/eta_date
+        # which mean different things on the two tables).
+        for table, time_column in (
+            (FUTURES_TABLE, "price_timestamp"),
+            (TRADES_TABLE, "ingested_at"),
+            (SHIPMENTS_TABLE, "ingested_at"),
+        ):
+            table_exists = con.execute(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?", [table]
+            ).fetchone()[0]
+            if not table_exists:
+                info(f"{table}: does not exist yet - nothing to prune")
+                continue
+            before = count_rows(con, table)
+            con.execute(f"DELETE FROM {table} WHERE {time_column} < ?", [cutoff])
+            after = count_rows(con, table)
+            removed = before - after
+            if removed:
+                info(f"{table}: removed {removed} row(s) from before today ({after} row(s) remain)")
+            else:
+                ok(f"{table}: nothing to prune yet ({after} row(s), all from today)")
+    finally:
+        if con is not None:
+            con.close()
+
+
 # ----------------------------------------------------------------------------
 # MAIN
 # ----------------------------------------------------------------------------
@@ -407,20 +487,30 @@ def main():
         stage = "SECTION 1 (fetch FX rates)"
         fx = fetch_live_fx_rates()
 
-        stage = "SECTION 2 (simulate futures price)"
+        # Backfill runs BEFORE the live tick and is non-fatal on its own: if it
+        # fails, today's chart just starts a little thinner than planned, but
+        # that must never stop this run's own live price/trades/shipments from
+        # being generated and written.
+        stage = "SECTION 2 (seed today's price history, first run of the day only)"
+        try:
+            backfill_todays_price_history(rng, DB_PATH, now_utc=run_ts)
+        except duckdb.Error as exc:
+            warn(f"Backfilling today's price history failed (today's chart may start thin): {exc}")
+
+        stage = "SECTION 3 (simulate futures price)"
         futures_df, futures_price = simulate_futures_price(rng, DB_PATH, run_id, run_ts)
 
-        stage = "SECTION 3 (generate trades and shipments)"
+        stage = "SECTION 4 (generate trades and shipments)"
         trades_df = generate_raw_coffee_trades(fx, futures_price, rng, run_id, run_ts)
         shipments_df = generate_shipments(trades_df, rng, run_id, run_ts)
 
-        stage = "SECTION 4 (validate data)"
-        section("SECTION 4 - Validating data before writing")
+        stage = "SECTION 5 (validate data)"
+        section("SECTION 5 - Validating data before writing")
         futures_df = validate_futures(futures_df)
         trades_df = validate_trades(trades_df)
         shipments_df = validate_shipments(shipments_df, trades_df)
 
-        stage = "SECTION 5 (write to DuckDB)"
+        stage = "SECTION 6 (write to DuckDB)"
         write_to_duckdb(
             [
                 (FUTURES_TABLE, FUTURES_COLUMNS, futures_df),
@@ -428,6 +518,14 @@ def main():
                 (SHIPMENTS_TABLE, SHIPMENTS_COLUMNS, shipments_df),
             ]
         )
+
+        # Pruning runs AFTER the write above has already succeeded and committed,
+        # so a pruning problem is only ever a warning, never a reason to report
+        # this run as failed - this run's data is safely on disk either way.
+        try:
+            prune_old_runs(run_ts)
+        except duckdb.Error as exc:
+            warn(f"Pruning old runs failed, but this run's data was already written safely: {exc}")
 
     except DataValidationError as exc:
         fail(f"Stopped in {stage}. Bad data, nothing was written: {exc}")
